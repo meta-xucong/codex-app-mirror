@@ -1,0 +1,134 @@
+name: Sync upstream Codex mirror
+
+on:
+  workflow_dispatch:
+  schedule:
+    # GitHub may delay scheduled jobs during load; this is intentionally more
+    # frequent than the end-user installer needs.
+    - cron: "17 */3 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: codex-app-mirror-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPOSITORY: Wangnov/codex-app-mirror
+  UPSTREAM_BRANCH: main
+
+jobs:
+  sync:
+    name: Merge upstream and mirror latest Windows x64 release
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Merge upstream main and tags
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git remote set-url upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          else
+            git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          fi
+
+          git fetch upstream "${UPSTREAM_BRANCH}" --tags --prune
+          git checkout main
+
+          if git merge-base --is-ancestor "upstream/${UPSTREAM_BRANCH}" HEAD; then
+            echo "Fork main is already based on the current upstream commit."
+          else
+            # Keep this workflow in the fork while retaining all upstream
+            # commits. A merge commit avoids resetting the workflow away.
+            git merge --no-edit --no-ff "upstream/${UPSTREAM_BRANCH}" \
+              -m "chore(sync): merge ${UPSTREAM_REPOSITORY}"
+            git push origin main
+          fi
+
+          # New upstream release tags are copied without rewriting existing tags.
+          git push origin --tags
+
+      - name: Mirror latest stable Windows x64 MSIX release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          temp_dir="$(mktemp -d)"
+          trap 'rm -rf "$temp_dir"' EXIT
+
+          upstream_releases="$(gh api "repos/${UPSTREAM_REPOSITORY}/releases?per_page=100")"
+          latest_tag="$(jq -r '[.[] | select(.draft == false and .prerelease == false)][0].tag_name // empty' <<<"$upstream_releases")"
+          if [[ -z "$latest_tag" ]]; then
+            echo "No stable upstream release was found."
+            exit 0
+          fi
+
+          upstream_release="$(gh api "repos/${UPSTREAM_REPOSITORY}/releases/tags/${latest_tag}")"
+          windows_asset="$(jq -r '[.assets[] | select(.name | test("OpenAI\\.Codex_.*_x64__.*\\.(Msix|msix)$")) | .name][0] // empty' <<<"$upstream_release")"
+          if [[ -z "$windows_asset" ]]; then
+            echo "Stable release ${latest_tag} has no Windows x64 MSIX asset."
+            exit 0
+          fi
+
+          required_assets=(
+            "$windows_asset"
+            "SHA256SUMS-windows.txt"
+            "release-manifest.json"
+          )
+
+          fork_release=""
+          if fork_release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${latest_tag}" 2>/dev/null)"; then
+            echo "Fork release ${latest_tag} already exists."
+          else
+            fork_release=""
+            echo "Fork release ${latest_tag} does not exist and will be created."
+          fi
+
+          assets_to_download=()
+          for asset in "${required_assets[@]}"; do
+            if [[ -z "$fork_release" ]] || ! jq -e --arg name "$asset" '.assets[]?.name == $name' <<<"$fork_release" >/dev/null; then
+              assets_to_download+=("$asset")
+            fi
+          done
+
+          for asset in "${assets_to_download[@]}"; do
+            gh release download "$latest_tag" \
+              --repo "$UPSTREAM_REPOSITORY" \
+              --pattern "$asset" \
+              --dir "$temp_dir" \
+              --clobber
+          done
+
+          title="$(jq -r '.name // .tag_name' <<<"$upstream_release")"
+          jq -r '.body // ""' <<<"$upstream_release" > "$temp_dir/release-notes.md"
+
+          if [[ -z "$fork_release" ]]; then
+            gh release create "$latest_tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --title "$title" \
+              --notes-file "$temp_dir/release-notes.md" \
+              --latest \
+              "${required_assets[@]/#/$temp_dir/}"
+          else
+            for asset in "${assets_to_download[@]}"; do
+              gh release upload "$latest_tag" "$temp_dir/$asset" \
+                --repo "$GITHUB_REPOSITORY"
+            done
+          fi
+
+          echo "Mirrored ${latest_tag}: ${windows_asset}"
