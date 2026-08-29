@@ -57,8 +57,9 @@ jobs:
             git push origin main
           fi
 
-          # New upstream release tags are copied without rewriting existing tags.
-          git push origin --tags
+          # Release tags are created by the GitHub Release API below. Pushing
+          # every upstream tag would require a personal token with the special
+          # `workflows` scope because historical commits contain Actions files.
 
       - name: Mirror latest stable Windows x64 MSIX release
         env:
@@ -119,7 +120,6 @@ jobs:
           if [[ -z "$fork_release" ]]; then
             gh release create "$latest_tag" \
               --repo "$GITHUB_REPOSITORY" \
-              --verify-tag \
               --title "$title" \
               --notes-file "$temp_dir/release-notes.md" \
               --latest \
